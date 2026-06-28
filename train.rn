@@ -1,0 +1,180 @@
+// train.rn  —  Two-layer MLP on MNIST with mini-batch Adam + dropout + LR decay
+//
+// Architecture : 784 -> HIDDEN -> (dropout) -> 10
+// Optimizer    : Adam with cosine LR annealing
+// Regularizer  : inverted dropout on hidden activations
+//
+// Memory strategy: csv::readToMatrixT loads directly into (features, samples)
+// transposed+scaled in one C pass — no duplicate matrix copies during loading.
+// math::adamStep updates moments in-place — only 1 new matrix per param per step.
+//
+// Target: 99% test accuracy
+
+benutzen "math";
+benutzen "csv";
+benutzen "str";
+
+// ── Hyperparameters ────────────────────────────────────────────────────────
+var HIDDEN   = 1024;        // hidden layer size (larger = more capacity)
+var BATCH    = 128;         // mini-batch size
+var EPOCHS   = 60;          // training epochs
+var LR_MAX   = 0.001;       // Adam peak LR (cosine start)
+var LR_MIN   = 0.00005;     // Adam floor LR (cosine end)
+var BETA1    = 0.9;
+var BETA2    = 0.999;
+var EPS      = 0.00000001;
+var DROPOUT  = 0.25;        // drop probability for hidden layer
+var DROP_SCL = 1.0 / (1.0 - DROPOUT);  // inverted dropout scale
+var MAX_SHIFT = 2;          // random pixel shift for data augmentation (±2 px)
+var PI       = 3.14159265358979;
+var INPUT    = 784;
+var CLASSES  = 10;
+var N_TRAIN  = 60000;
+var N_TEST   = 10000;
+var SCALE    = 1.0 / 255.0;
+
+// ── Utility ────────────────────────────────────────────────────────────────
+fun ns(x) { return str::format("{0}", x); }
+
+// ── Fisher-Yates shuffle ───────────────────────────────────────────────────
+fun shuffleIndices(n) {
+  var idx = #[];
+  for (var i = 0; i < n; i = i + 1) { idx->push(i); }
+  for (var i = n - 1; i > 0; i = i - 1) {
+    var j = math::randomInt(i + 1);
+    var tmp = idx#[i];
+    idx#[i] = idx#[j];
+    idx#[j] = tmp;
+  }
+  return idx;
+}
+
+// ── Count matches between two arrays of length n ──────────────────────────
+fun countCorrect(preds, true_lab, n) {
+  var correct = 0;
+  for (var i = 0; i < n; i = i + 1) {
+    if (preds#[i] == true_lab#[i]) { correct = correct + 1; }
+  }
+  return correct;
+}
+
+// ══════════════════════════════════════════════════════════════════════════
+// Load data — readToMatrixT reads, transposes, and scales in one C pass
+// Output shape: (784, N) — columns are samples
+// ══════════════════════════════════════════════════════════════════════════
+print "Loading training data ...";
+var X_train      = csv::readToMatrixT("archive/mnist_train.csv", 1, 1, 785, SCALE);
+var train_labels = csv::readLabels("archive/mnist_train.csv", 1, 0);
+
+print "Loading test data ...";
+var X_test      = csv::readToMatrixT("archive/mnist_test.csv", 1, 1, 785, SCALE);
+var test_labels = csv::readLabels("archive/mnist_test.csv", 1, 0);
+
+// ══════════════════════════════════════════════════════════════════════════
+// Weight initialisation  (randomMatrix uses He/Xavier scale internally)
+// ══════════════════════════════════════════════════════════════════════════
+print "Initialising weights ...";
+var W1 = math::randomMatrix(HIDDEN, INPUT);    // (1024, 784)
+var b1 = math::zeros(HIDDEN, 1);
+var W2 = math::randomMatrix(CLASSES, HIDDEN);  // (10, 1024)
+var b2 = math::zeros(CLASSES, 1);
+
+// Adam moment matrices — updated in-place by math::adamStep
+var m_W1 = math::zeros(HIDDEN, INPUT);   var v_W1 = math::zeros(HIDDEN, INPUT);
+var m_b1 = math::zeros(HIDDEN, 1);       var v_b1 = math::zeros(HIDDEN, 1);
+var m_W2 = math::zeros(CLASSES, HIDDEN); var v_W2 = math::zeros(CLASSES, HIDDEN);
+var m_b2 = math::zeros(CLASSES, 1);      var v_b2 = math::zeros(CLASSES, 1);
+
+var t = 0;
+
+// ══════════════════════════════════════════════════════════════════════════
+// Training loop
+// ══════════════════════════════════════════════════════════════════════════
+print "Training ...";
+print "";
+
+var num_batches = math::ceil(N_TRAIN / BATCH);
+var best_acc = 0.0;
+
+for (var epoch = 1; epoch <= EPOCHS; epoch = epoch + 1) {
+
+  // Cosine LR annealing: high at epoch 1, low at epoch EPOCHS
+  var cos_arg  = PI * (epoch - 1) / EPOCHS;
+  var cur_lr   = LR_MIN + (LR_MAX - LR_MIN) * (1.0 + math::cos(cos_arg)) / 2.0;
+
+  var idx = shuffleIndices(N_TRAIN);
+
+  for (var b = 0; b < num_batches; b = b + 1) {
+    var start = b * BATCH;
+    var end_b = math::min(start + BATCH, N_TRAIN);
+    var m_sz  = end_b - start;
+
+    // ── Batch ──────────────────────────────────────────────────────────
+    var batch_idx = idx->slice(start, end_b);
+    // Apply random ±2 pixel shift to each image before training
+    var X = math::randomShiftCols(math::mgetColsByIndex(X_train, batch_idx), MAX_SHIFT);
+
+    var batch_labels = #[];
+    for (var i = 0; i < m_sz; i = i + 1) {
+      batch_labels->push(train_labels#[batch_idx#[i]]);
+    }
+    var Y = math::transpose(math::oneHot(batch_labels, CLASSES));
+
+    // ── Forward (with dropout on hidden layer) ──────────────────────────
+    var Z1   = math::madd(math::matmul(W1, X), b1);
+    var A1r  = math::relu(Z1);
+    // inverted dropout: mask is (HIDDEN, m_sz), scale keeps expectation the same
+    var mask = math::dropoutMask(HIDDEN, m_sz, DROPOUT);
+    var A1   = math::mscale(math::mmul(A1r, mask), DROP_SCL);
+
+    var Z2 = math::madd(math::matmul(W2, A1), b2);
+    var A2 = math::msoftmax(Z2);
+
+    // ── Backward ────────────────────────────────────────────────────────
+    var dZ2 = math::msub(A2, Y);
+    var dW2 = math::mscale(math::matmul(dZ2, math::transpose(A1)), 1.0 / m_sz);
+    var db2 = math::mscale(math::msum(dZ2, 1), 1.0 / m_sz);
+
+    // Backprop through dropout then ReLU
+    var dA1r = math::mscale(math::mmul(math::matmul(math::transpose(W2), dZ2), mask), DROP_SCL);
+    var dZ1  = math::mmul(dA1r, math::mreluDeriv(Z1));
+    var dW1  = math::mscale(math::matmul(dZ1, math::transpose(X)), 1.0 / m_sz);
+    var db1  = math::mscale(math::msum(dZ1, 1), 1.0 / m_sz);
+
+    // ── Adam update (in-place moments, returns new param) ───────────────
+    t  = t + 1;
+    W1 = math::adamStep(W1, dW1, m_W1, v_W1, t, cur_lr, BETA1, BETA2, EPS);
+    b1 = math::adamStep(b1, db1, m_b1, v_b1, t, cur_lr, BETA1, BETA2, EPS);
+    W2 = math::adamStep(W2, dW2, m_W2, v_W2, t, cur_lr, BETA1, BETA2, EPS);
+    b2 = math::adamStep(b2, db2, m_b2, v_b2, t, cur_lr, BETA1, BETA2, EPS);
+  }
+
+  // ── Test evaluation (no dropout) ─────────────────────────────────────
+  var Z1t = math::madd(math::matmul(W1, X_test), b1);
+  var A1t = math::relu(Z1t);
+  var Z2t = math::madd(math::matmul(W2, A1t), b2);
+  var A2t = math::msoftmax(Z2t);
+
+  var preds   = math::argmax(A2t);
+  var correct = countCorrect(preds, test_labels, N_TEST);
+  var acc_pct = (correct / N_TEST) * 100.0;
+
+  if (acc_pct > best_acc) { best_acc = acc_pct; }
+
+  print "Epoch " + ns(epoch) + "/" + ns(EPOCHS) +
+        "  lr=" + ns(cur_lr) +
+        "  correct=" + ns(correct) + "/" + ns(N_TEST) +
+        "  acc=" + ns(acc_pct) + "%" +
+        "  best=" + ns(best_acc) + "%";
+}
+
+// ══════════════════════════════════════════════════════════════════════════
+// Save weights
+// ══════════════════════════════════════════════════════════════════════════
+print "";
+print "Saving weights ...";
+math::saveMatrix(W1, "weights/w1.bin");
+math::saveMatrix(b1, "weights/b1.bin");
+math::saveMatrix(W2, "weights/w2.bin");
+math::saveMatrix(b2, "weights/b2.bin");
+print "Done. Best test accuracy: " + ns(best_acc) + "%";

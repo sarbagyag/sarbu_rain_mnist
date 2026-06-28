@@ -1,0 +1,102 @@
+benutzen "math";
+benutzen "str";
+
+fun ns(x) { return str::format("{0}", x); }
+
+print "=== smoke_test.rn ===";
+
+// 1. zeros + shape
+var A = math::zeros(3, 4);
+var s = math::shape(A);
+print "zeros(3,4) shape: " + ns(s#[0]) + " x " + ns(s#[1]);
+
+// 2. randomMatrix + matmul
+var W = math::randomMatrix(4, 3);
+var X = math::randomMatrix(3, 2);
+var Z = math::matmul(W, X);
+var sz = math::shape(Z);
+print "matmul (4x3)*(3x2) -> " + ns(sz#[0]) + " x " + ns(sz#[1]);
+
+// 3. relu element-wise on matrix
+var R = math::relu(Z);
+var rs = math::shape(R);
+print "relu shape: " + ns(rs#[0]) + " x " + ns(rs#[1]);
+
+// 4. NEW: msqrt — element-wise sqrt
+var ones23 = math::ones(2, 3);
+var sqrtV = math::msqrt(ones23);
+var sqs = math::shape(sqrtV);
+print "msqrt(ones(2,3)) shape: " + ns(sqs#[0]) + " x " + ns(sqs#[1]);
+
+// 5. NEW: mdiv — element-wise divide
+var num   = math::fromArray(#[#[6.0, 8.0], #[9.0, 12.0]]);
+var denom = math::fromArray(#[#[2.0, 4.0], #[3.0, 4.0]]);
+var quot  = math::mdiv(num, denom);
+var qs = math::shape(quot);
+print "mdiv shape: " + ns(qs#[0]) + " x " + ns(qs#[1]);
+
+// 6. saveMatrix / loadMatrix round-trip
+var M  = math::randomMatrix(5, 5);
+math::saveMatrix(M, "weights/test.bin");
+var M2 = math::loadMatrix("weights/test.bin");
+var ms1 = math::shape(M);
+var ms2 = math::shape(M2);
+print "round-trip: " + ns(ms1#[0]) + "x" + ns(ms1#[1]) + " -> " + ns(ms2#[0]) + "x" + ns(ms2#[1]);
+
+// 7. msum
+var Q = math::mscale(math::ones(3, 2), 3.0);
+var rowsums = math::msum(Q, 1);
+var colsums = math::msum(Q, 0);
+var rss = math::shape(rowsums);
+var css = math::shape(colsums);
+print "msum axis=1 (3x1): " + ns(rss#[0]) + "x" + ns(rss#[1]);
+print "msum axis=0 (1x2): " + ns(css#[0]) + "x" + ns(css#[1]);
+
+// 8. msoftmax
+var logits = math::fromArray(#[#[1.0, 2.0], #[3.0, 4.0], #[5.0, 6.0]]);
+var probs  = math::msoftmax(logits);
+var ps = math::shape(probs);
+print "msoftmax(3x2) shape: " + ns(ps#[0]) + "x" + ns(ps#[1]);
+
+// 9. oneHot -> transpose -> argmax round-trip: expect [0, 2, 1, 3]
+var labels = #[0, 2, 1, 3];
+var oh  = math::oneHot(labels, 4);
+var ohT = math::transpose(oh);
+var preds = math::argmax(ohT);
+print "oneHot->argmax: " + ns(preds#[0]) + " " + ns(preds#[1]) + " " + ns(preds#[2]) + " " + ns(preds#[3]);
+
+// 10. broadcast: madd (3x2) + (3x1) bias
+var W2 = math::ones(3, 2);
+var b  = math::fromArray(#[1.0, 2.0, 3.0]);  // 1D -> (3,1)
+var Zb = math::madd(W2, b);
+var zbs = math::shape(Zb);
+print "broadcast madd (3x2)+(3x1): " + ns(zbs#[0]) + "x" + ns(zbs#[1]);
+
+// 11. Array element assignment
+var arr = #[10, 20, 30];
+arr#[1] = 99;
+print "arr after arr#[1]=99: " + ns(arr#[0]) + " " + ns(arr#[1]) + " " + ns(arr#[2]);
+
+// 12. Full Adam step dry-run — the key test for msqrt + mdiv
+var grad = math::fromArray(#[#[0.1, -0.2], #[0.3, 0.0]]);
+var m_t  = math::zeros(2, 2);
+var v_t  = math::zeros(2, 2);
+var beta1 = 0.9;
+var beta2 = 0.999;
+var eps  = 0.00000001;
+var lr   = 0.001;
+
+m_t = math::madd(math::mscale(m_t, beta1), math::mscale(grad, 1.0 - beta1));
+v_t = math::madd(math::mscale(v_t, beta2), math::mscale(math::mmul(grad, grad), 1.0 - beta2));
+
+var mhat  = math::mscale(m_t, 1.0 / (1.0 - math::pow(beta1, 1)));
+var vhat  = math::mscale(v_t, 1.0 / (1.0 - math::pow(beta2, 1)));
+var eps_m = math::mscale(math::ones(1, 1), eps);
+var denom2 = math::madd(math::msqrt(vhat), eps_m);
+var delta  = math::mscale(math::mdiv(mhat, denom2), lr);
+var param  = math::msub(math::zeros(2, 2), delta);
+var pshape = math::shape(param);
+print "Adam step output shape: " + ns(pshape#[0]) + "x" + ns(pshape#[1]);
+
+print "";
+print "=== All smoke tests passed! ===";

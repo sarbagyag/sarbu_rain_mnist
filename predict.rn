@@ -1,0 +1,90 @@
+// predict.rn  —  Load saved weights and run inference on MNIST test set
+//
+// Loads weights/w1.bin, b1.bin, w2.bin, b2.bin written by train.rn
+// (format: int32 rows, int32 cols, row-major float64 — same as math::saveMatrix)
+// and reports accuracy on the 10 000 test images.
+//
+// Run:
+//   ./rain predict.rn
+
+benutzen "math";
+benutzen "csv";
+benutzen "str";
+
+var N_TEST  = 10000;
+var CLASSES = 10;
+var SCALE   = 1.0 / 255.0;
+
+fun ns(x) {
+  return str::format("{0}", x);
+}
+
+fun countCorrect(preds, true_lab, n) {
+  var correct = 0;
+  for (var i = 0; i < n; i = i + 1) {
+    if (preds#[i] == true_lab#[i]) {
+      correct = correct + 1;
+    }
+  }
+  return correct;
+}
+
+// ── Load saved weights ────────────────────────────────────────────────────
+print "Loading weights ...";
+var W1 = math::loadMatrix("weights/w1.bin");
+var b1 = math::loadMatrix("weights/b1.bin");
+var W2 = math::loadMatrix("weights/w2.bin");
+var b2 = math::loadMatrix("weights/b2.bin");
+
+var s1 = math::shape(W1);
+var s2 = math::shape(W2);
+print "W1: " + ns(s1#[0]) + "x" + ns(s1#[1]);
+print "W2: " + ns(s2#[0]) + "x" + ns(s2#[1]);
+
+// ── Load test set ─────────────────────────────────────────────────────────
+print "Loading test data ...";
+var test_raw  = csv::read("archive/mnist_test.csv");
+var test_data = csv::sliceRows(test_raw, 1, 10001);
+
+var test_pixels = #[];
+var test_labels = #[];
+for (var i = 0; i < N_TEST; i = i + 1) {
+  var row = test_data#[i];
+  test_labels->push(row#[0]);
+  test_pixels->push(row->slice(1, 785));
+}
+var X_test = math::mscale(math::transpose(math::fromArray(test_pixels)), SCALE);
+test_pixels = #[];
+
+// ── Forward pass ─────────────────────────────────────────────────────────
+print "Running inference ...";
+var Z1 = math::madd(math::matmul(W1, X_test), b1);
+var A1 = math::relu(Z1);
+var Z2 = math::madd(math::matmul(W2, A1), b2);
+var A2 = math::msoftmax(Z2);
+
+// ── Accuracy ─────────────────────────────────────────────────────────────
+var preds   = math::argmax(A2);
+var correct = countCorrect(preds, test_labels, N_TEST);
+var acc_pct = (correct / N_TEST) * 100.0;
+
+print "";
+print "Test accuracy: " + ns(correct) + " / " + ns(N_TEST) + "  =  " + ns(acc_pct) + "%";
+
+// ── Per-class breakdown ───────────────────────────────────────────────────
+print "";
+print "Per-class accuracy:";
+var class_correct = #[0, 0, 0, 0, 0, 0, 0, 0, 0, 0];
+var class_total   = #[0, 0, 0, 0, 0, 0, 0, 0, 0, 0];
+for (var i = 0; i < N_TEST; i = i + 1) {
+  var label = test_labels#[i];
+  var pred  = preds#[i];
+  class_total#[label]   = class_total#[label] + 1;
+  if (pred == label) {
+    class_correct#[label] = class_correct#[label] + 1;
+  }
+}
+for (var c = 0; c < CLASSES; c = c + 1) {
+  var ca = (class_correct#[c] / class_total#[c]) * 100.0;
+  print "  digit " + ns(c) + ": " + ns(class_correct#[c]) + "/" + ns(class_total#[c]) + "  (" + ns(ca) + "%)";
+}
